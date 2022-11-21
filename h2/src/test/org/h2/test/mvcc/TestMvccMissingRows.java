@@ -36,7 +36,7 @@ public class TestMvccMissingRows extends TestDb {
      * @param a ignored
      */
     public static void main(String... a) throws Exception {
-        for (int i = 0; i < 10000; ++i) {
+        for (int i = 0; i < 1000; ++i) {
             TestBase.createCaller().init().testFromMain();
         }
     }
@@ -69,7 +69,7 @@ public class TestMvccMissingRows extends TestDb {
         }
 
         int count = 200;
-        ExecutorService executor = Executors.newFixedThreadPool(3);
+        ExecutorService executor = Executors.newFixedThreadPool(20);
         CompletableFuture allFutures = CompletableFuture.completedFuture(null);
         ArrayList<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < count; i++) {
