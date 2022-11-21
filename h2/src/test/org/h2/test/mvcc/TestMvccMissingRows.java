@@ -16,10 +16,14 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.BiConsumer;
+import java.util.logging.Logger;
 
 /**
  * Multi-threaded MVCC (multi version concurrency) test cases.
@@ -32,7 +36,9 @@ public class TestMvccMissingRows extends TestDb {
      * @param a ignored
      */
     public static void main(String... a) throws Exception {
-        TestBase.createCaller().init().testFromMain();
+        for (int i = 0; i < 10000; ++i) {
+            TestBase.createCaller().init().testFromMain();
+        }
     }
 
     @Override
@@ -45,77 +51,156 @@ public class TestMvccMissingRows extends TestDb {
         testInsertingAndDeletingWithForeignKey();
     }
 
+    private static final Logger LOG = Logger.getLogger("TestMvccMissingRows");
+
     private void testInsertingAndDeletingWithForeignKey() throws Exception {
         deleteDb(getTestName());
         Connection conn = getConnection(getTestName());
         Statement stat = conn.createStatement();
         stat.execute("create table parent(parent_id varchar not null primary key, parent_value varchar)");
-        stat.execute("create table child(child_id varchar not null primary key, parent_id varchar not null, child_value varchar, FOREIGN KEY (parent_id) REFERENCES parent(parent_id))");
-        int count = 300;
-        ExecutorService executor = Executors.newFixedThreadPool(5);
+        stat.execute("create table association(child_id varchar not null primary key, parent_id varchar not null, FOREIGN KEY (parent_id) REFERENCES parent(parent_id), FOREIGN KEY (parent_id) REFERENCES parent(parent_id))");
+
+        String parentUUID = UUID.randomUUID().toString();
+        PreparedStatement insertParent = conn.prepareStatement("insert into parent(parent_id, parent_value) values(?, ?)");
+        insertParent.setString(1, parentUUID);
+        insertParent.setString(2, "parent");
+        if (insertParent.executeUpdate() != 1) {
+            throw new AssertionError("didn't insert one row");
+        }
+
+        int count = 200;
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        CompletableFuture allFutures = CompletableFuture.completedFuture(null);
         ArrayList<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < count; i++) {
-            Task task = new Task() {
+            String index = Integer.toString(i);
+            CompletableFuture future = CompletableFuture.runAsync(new Runnable() {
                 @Override
-                public void call() throws Exception {
-                    String parentUuid = UUID.randomUUID().toString();
-                    {
-                        Connection conn = getConnectionFromPool();
-                        conn.setAutoCommit(false);
-                        String childUuid = UUID.randomUUID().toString();
-                        PreparedStatement insertParent = conn.prepareStatement("insert into parent(parent_id, parent_value) values(?, ?)");
-                        insertParent.setString(1, parentUuid);
-                        insertParent.setString(2, "parent");
-                        if (insertParent.executeUpdate() != 1) {
-                            throw new AssertionError("didn't insert one row");
-                        }
-                        PreparedStatement insertChild = conn.prepareStatement("insert into child(child_id, parent_id, child_value) values(?, ?, ?)");
-                        insertChild.setString(1, childUuid);
-                        insertChild.setString(2, parentUuid);
-                        insertChild.setString(3, "child");
-                        if (insertChild.executeUpdate() != 1) {
-                            throw new AssertionError("didn't insert one row");
-                        }
-                        conn.commit();
-                        returnConnectionToPool(conn);
-                    }
+                public void run() {
+                    try {
+                        String childUUID = UUID.randomUUID().toString();
+                        {
+                            LOG.info("Starting creating tx");
+                            Connection conn = getConnectionFromPool();
+                            conn.setAutoCommit(false);
 
-                    {
-                        Connection conn = getConnectionFromPool();
-                        conn.setAutoCommit(false);
-                        PreparedStatement selectParentAndChildData = conn.prepareStatement("SELECT parent.parent_id, child.child_id\n" +
-                                "    FROM parent\n" +
-                                "    JOIN child\n" +
-                                "        ON (child.parent_id = parent.parent_id) WHERE parent.parent_id = ?;");
-                        selectParentAndChildData.setString(1, parentUuid);
-                        ResultSet resultSet = selectParentAndChildData.executeQuery();
-                        String childUuid;
-                        if (resultSet.next()) {
-                            childUuid = resultSet.getString(2);
-                        } else {
-                            throw new AssertionError("didn't find the child row when joining with the parent");
+                            PreparedStatement insertParent = conn.prepareStatement("insert into parent(parent_id, parent_value) values(?, ?)");
+                            insertParent.setString(1, childUUID);
+                            insertParent.setString(2, "child" + index);
+                            if (insertParent.executeUpdate() != 1) {
+                                throw new AssertionError("didn't insert one row");
+                            }
+
+                            PreparedStatement insertChild = conn.prepareStatement("insert into association(child_id, parent_id) values(?, ?)");
+                            insertChild.setString(1, childUUID);
+                            insertChild.setString(2, parentUUID);
+                            if (insertChild.executeUpdate() != 1) {
+                                throw new AssertionError("didn't insert one row");
+                            }
+
+                            conn.commit();
+                            LOG.info("Ending creating tx");
+                            returnConnectionToPool(conn);
                         }
-                        PreparedStatement deleteChild = conn.prepareStatement("delete from child where child_id = ?");
-                        deleteChild.setString(1, childUuid);
-                        if (deleteChild.executeUpdate() != 1) {
-                            throw new AssertionError("didn't delete one row");
+
+                        {
+                            LOG.info("Starting reading tx");
+                            Connection conn = getConnectionFromPool();
+                            conn.setAutoCommit(false);
+                            PreparedStatement selectParentAndChildData = conn.prepareStatement("SELECT parent.parent_id, child.parent_id\n" +
+                                    "    FROM parent as parent\n" +
+                                    "    JOIN association\n" +
+                                    "        ON association.parent_id = parent.parent_id\n" +
+                                    "    JOIN parent as child\n" +
+                                    "        ON (association.child_id = child.parent_id) WHERE parent.parent_id = ?;");
+
+                            selectParentAndChildData.setString(1, parentUUID);
+
+                            ResultSet resultSet = selectParentAndChildData.executeQuery();
+                            List<String> childEntities = new ArrayList<>();
+                            while (resultSet.next()) {
+                                childEntities.add(resultSet.getString(2));
+                            }
+                            LOG.info("Returned child entities: " + childEntities.size());
+                            assertTrue(childEntities.contains(childUUID));
+                            conn.commit();
+                            LOG.info("Ending reading tx");
+                            returnConnectionToPool(conn);
                         }
-                        PreparedStatement deleteParent = conn.prepareStatement("delete from parent where parent_id = ?");
-                        deleteParent.setString(1, parentUuid);
-                        if (deleteParent.executeUpdate() != 1) {
-                            throw new AssertionError("didn't delete one row");
+
+                        {
+                            LOG.info("Starting deleting tx");
+                            Connection conn = getConnectionFromPool();
+                            conn.setAutoCommit(false);
+
+                            // Find all parents that contains child we are trying to remove
+                            PreparedStatement selectAllParentsForChild = conn.prepareStatement("SELECT parent.parent_id, child.parent_id\n" +
+                                    "    FROM parent as parent\n" +
+                                    "    JOIN association\n" +
+                                    "        ON association.parent_id = parent.parent_id\n" +
+                                    "    JOIN parent as child\n" +
+                                    "        ON (association.child_id = child.parent_id) WHERE child.parent_id = ?;");
+
+                            selectAllParentsForChild.setString(1, childUUID);
+                            ResultSet resultSet = selectAllParentsForChild.executeQuery();
+                            // Should be always parentUUID
+                            if (resultSet.next()) {
+                                assertEquals(parentUUID, resultSet.getString(1));
+                            } else {
+                                throw new AssertionError("didn't find the child row when joining with the parent");
+                            }
+
+                            // Load parent from the database with all children (done by hibernate so we are able to call removeAssociatedEntity on it)
+                            PreparedStatement selectParentAndChildData = conn.prepareStatement("SELECT parent.parent_id, child.parent_id\n" +
+                                    "    FROM parent as parent\n" +
+                                    "    JOIN association\n" +
+                                    "        ON association.parent_id = parent.parent_id\n" +
+                                    "    JOIN parent as child\n" +
+                                    "        ON (association.child_id = child.parent_id) WHERE parent.parent_id = ?;");
+                            selectParentAndChildData.setString(1, parentUUID);
+
+                            ResultSet selectParentAndChildDataResultSet = selectParentAndChildData.executeQuery();
+                            List<String> childEntities = new ArrayList<>();
+                            while (selectParentAndChildDataResultSet.next()) {
+                                childEntities.add(resultSet.getString(2));
+                            }
+                            LOG.info("Returned child entities: " + childEntities.size());
+                            assertTrue(childEntities.contains(childUUID)); // This is where Keycloak code return wrong result
+
+                            PreparedStatement deleteAssociation = conn.prepareStatement("delete from association where child_id = ? and parent_id = ?");
+                            deleteAssociation.setString(1, childUUID);
+                            deleteAssociation.setString(2, parentUUID);
+                            if (deleteAssociation.executeUpdate() != 1) {
+                                throw new AssertionError("didn't delete one row");
+                            }
+
+                            PreparedStatement deleteChild = conn.prepareStatement("delete from parent where parent_id = ?");
+                            deleteChild.setString(1, childUUID);
+                            if (deleteChild.executeUpdate() != 1) {
+                                throw new AssertionError("didn't delete one row");
+                            }
+                            conn.commit();
+                            LOG.info("Ending deleting tx");
+                            returnConnectionToPool(conn);
                         }
-                        conn.commit();
-                        returnConnectionToPool(conn);
+                    } catch (SQLException e) {
+                        throw new RuntimeException(e);
                     }
                 }
-            };
-            futures.add(executor.submit(task));
+            }, executor).whenComplete(new BiConsumer<Void, Throwable>() {
+                @Override
+                public void accept(Void unused, Throwable throwable) {
+                    if (throwable != null) {
+                        throwable.printStackTrace();
+                    }
+                }
+            });
+
+            allFutures = CompletableFuture.allOf(allFutures, future);
         }
+
+        allFutures.get();
         executor.shutdown();
-        for (Future<?> future : futures) {
-            future.get();
-        }
         closeConnectionPool();
         conn.close();
         deleteDb(getTestName());
